@@ -7,7 +7,7 @@
 #include <vector>
 
 // ---------- USER CONFIG ----------
-const char* WIFI_SSID = "TUD";
+const char* WIFI_SSID = "SSID";
 const char* WIFI_PASS = "Password";
 String TARGET_STATION  = "";
 const uint32_t REFRESH_MS = 20000;
@@ -28,6 +28,17 @@ int16_t line1W = 0, line2W = 0;
 int scrollX = SCREEN_W;
 unsigned long lastFetch  = 0;
 unsigned long lastScroll = 0;
+
+// Async fetch support
+volatile bool fetchInProgress = false;
+volatile bool newLinesReady = false;
+String pendingLine1 = "";
+String pendingLine2 = "";
+TaskHandle_t fetchTaskHandle = nullptr;
+
+// Forward declarations
+void startFetchTask();
+void fetchTask(void*);
 
 std::vector<String> stationNames;
 
@@ -249,10 +260,10 @@ void updateLinesFromJson(const JsonDocument& doc) {
     }
     if (shown==0) newL1="No services";
   }
-  bool changed=false;
-  if (newL1!=line1){line1=newL1;measureTextWidth(line1,line1W);changed=true;}
-  if (newL2!=line2){line2=newL2;measureTextWidth(line2,line2W);changed=true;}
-  if (changed) scrollX=SCREEN_W;
+  // Instead of applying directly (may be called from fetch task) store pending
+  pendingLine1 = newL1;
+  pendingLine2 = newL2;
+  newLinesReady = true;
 }
 
 // build HTML page
@@ -310,22 +321,51 @@ void setup() {
   });
   server.begin();
   lastFetch=0; lastScroll=millis();
+  // Create fetch task pinned to core 0 (loop usually on core 1)
+  xTaskCreatePinnedToCore(fetchTask, "fetchTask", 8192, nullptr, 1, &fetchTaskHandle, 0);
 }
 
 // ---------- LOOP ----------
 void loop() {
   unsigned long now=millis();
   if(now-lastFetch>=REFRESH_MS && WiFi.status()==WL_CONNECTED){
-    if(TARGET_STATION.length()>0 && TARGET_STATION != "(no stations)") {
-      DynamicJsonDocument doc(20000);
-      String stationPath=urlEncodeSpacesLower(TARGET_STATION);
-      if(fetchStationJson(stationPath,doc)){updateLinesFromJson(doc);} else {
-        line1="API ERR"; line2=""; measureTextWidth(line1,line1W); measureTextWidth(line2,line2W); scrollX=SCREEN_W;
-      }
+    if(!fetchInProgress && TARGET_STATION.length()>0 && TARGET_STATION != "(no stations)") {
+      fetchInProgress = true; // signal task to do a cycle
     }
     lastFetch=now;
+  }
+  // Apply new lines if ready (main thread only touches display vars)
+  if (newLinesReady) {
+    newLinesReady = false;
+    bool changed=false;
+    if (pendingLine1!=line1){line1=pendingLine1;measureTextWidth(line1,line1W);changed=true;}
+    if (pendingLine2!=line2){line2=pendingLine2;measureTextWidth(line2,line2W);changed=true;}
+    if (changed) scrollX=SCREEN_W;
   }
   tickScroll();
   drawFrame();
   delay(10);
+}
+
+// ---------------- ASYNC FETCH TASK ----------------
+void fetchTask(void* ) {
+  for(;;) {
+    if (fetchInProgress) {
+      if (WiFi.status()==WL_CONNECTED && TARGET_STATION.length()>0 && TARGET_STATION != "(no stations)") {
+        DynamicJsonDocument doc(20000);
+        String stationPath=urlEncodeSpacesLower(TARGET_STATION);
+        if(fetchStationJson(stationPath,doc)) {
+          updateLinesFromJson(doc);
+        } else {
+          pendingLine1 = "API ERR"; pendingLine2 = ""; newLinesReady = true;
+        }
+      }
+      fetchInProgress = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50)); // yield
+  }
+}
+
+void startFetchTask() {
+  // Not used (task started directly in setup), kept for potential future control
 }
