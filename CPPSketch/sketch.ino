@@ -1,83 +1,37 @@
-/*
-  ESP32 + 64x32 HUB75 + Irish Rail JSON wrapper + Web Form
-  - All text orange
-  - Header (TARGET_STATION) at top (baseline 7 to avoid clipping)
-  - Two departure lines moved up by 8px
-  - Both long lines scroll in sync
-  - Web page lets you change TARGET_STATION without re-uploading code
-*/
-
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ESPAsyncWebServer.h>           // Async web server
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
-#include <WebServer.h>
 #include <vector>
 
 // ---------- USER CONFIG ----------
 const char* WIFI_SSID = "TUD";
 const char* WIFI_PASS = "Password";
 String TARGET_STATION  = "";
-const uint32_t REFRESH_MS = 20000;   // API refresh period
-const uint32_t SCROLL_MS  = 40;      // marquee speed (lower=faster)
+const uint32_t REFRESH_MS = 20000;
+const uint32_t SCROLL_MS  = 40;
 
-// Panel config
 HUB75_I2S_CFG mxconfig(64, 32, 1);
 MatrixPanel_I2S_DMA* display;
 
-static inline uint16_t c565(uint8_t r, uint8_t g, uint8_t b) {
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-}
-uint16_t COLOR_ORANGE = c565(255, 140, 0);
+uint16_t COLOR_ORANGE;
 
-// Layout (moved up)
 const int Y_HEADER = 1;
-const int Y_LINE1  = 12;  // was 18 -> now 10 (up by 8px)
-const int Y_LINE2  = 24;  // was 28 -> now 20 (up by 8px)
+const int Y_LINE1  = 12;
+const int Y_LINE2  = 24;
 const int SCREEN_W = 64;
 
-// Current lines + widths
-String line1 = "";
-String line2 = "";
+String line1 = "", line2 = "";
 int16_t line1W = 0, line2W = 0;
-
-// Shared scrolling state
 int scrollX = SCREEN_W;
 unsigned long lastFetch  = 0;
 unsigned long lastScroll = 0;
 
-// ---------- Web Server ----------
-WebServer server(80);
+std::vector<String> stationNames;
 
-void handleRoot() {
-  String html = R"rawliteral(
-  <html>
-  <head><title>ESP32 Station</title></head>
-  <body>
-    <h2>Set Target Station</h2>
-    <form action="/set" method="POST">
-      <input type="text" name="station" placeholder="Station name">
-      <input type="submit" value="Update">
-    </form>
-    <p>Current target: )rawliteral";
-  html += TARGET_STATION;
-  html += "</p></body></html>";
-  server.send(200, "text/html", html);
-}
-
-void handleSet() {
-  if (server.hasArg("station")) {
-    TARGET_STATION = server.arg("station");
-    lastFetch = 0;  // force immediate refresh
-    String html = "<html><body><h2>Updated!</h2>"
-                  "<p>New target: " + TARGET_STATION + "</p>"
-                  "<a href='/'>Back</a></body></html>";
-    server.send(200, "text/html", html);
-  } else {
-    server.send(400, "text/plain", "No station provided");
-  }
-}
+AsyncWebServer server(80);
 
 // ---------- PIN MAP ----------
 void setCustomPins() {
@@ -107,30 +61,19 @@ void drawFrame() {
   display->setTextWrap(false);
   display->setTextSize(1);
   display->setTextColor(COLOR_ORANGE);
-
-  // Header
   display->setCursor(1, Y_HEADER);
   display->print(TARGET_STATION);
-
   bool s1 = (line1W > SCREEN_W);
   bool s2 = (line2W > SCREEN_W);
-
-  display->setCursor(s1 ? scrollX : 1, Y_LINE1);
-  display->print(line1);
-
-  display->setCursor(s2 ? scrollX : 1, Y_LINE2);
-  display->print(line2);
+  display->setCursor(s1 ? scrollX : 1, Y_LINE1); display->print(line1);
+  display->setCursor(s2 ? scrollX : 1, Y_LINE2); display->print(line2);
 }
-
 void tickScroll() {
   unsigned long now = millis();
   if (now - lastScroll < SCROLL_MS) return;
   lastScroll = now;
-
   if (line1W <= SCREEN_W && line2W <= SCREEN_W) return;
-
   scrollX -= 1;
-
   int16_t maxW = (line1W > line2W) ? line1W : line2W;
   if (scrollX < -maxW) scrollX = SCREEN_W;
 }
@@ -140,144 +83,248 @@ bool fetchStationJson(const String& stationLowerPath, JsonDocument& doc) {
   WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
   String url = "https://api.irishtnt.com/stations/name/" + stationLowerPath + "/90";
-  if (!http.begin(client, url)) return false;
-
-  int code = http.POST((uint8_t*)nullptr, 0);
-  if (code != 200) { http.end(); return false; }
-
-  DeserializationError err = deserializeJson(doc, http.getStream());
-  http.end();
-  return !err;
-}
-
-// ---------- JSON HELPERS ----------
-void getStationDirections(JsonArrayConst trains, const String& targetStation,
-                          std::vector<String>& directions) {
-  directions.clear();
-  for (JsonObjectConst t : trains) {
-    const char* dest = t["destination"] | "";
-    const char* dir  = t["direction"]   | "";
-    if (!dest || !dir) continue;
-    if (String(dest) == targetStation) continue;
-    bool seen = false;
-    for (auto& d : directions) if (d == String(dir)) { seen = true; break; }
-    if (!seen) directions.push_back(String(dir));
+  if (!http.begin(client, url)) {
+    Serial.println("[station] http.begin failed");
+    return false;
   }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Accept-Encoding", "identity");
+  int code = http.POST((uint8_t*)nullptr, 0);
+  if (code != 200) {
+    Serial.print("[station] POST status: "); Serial.println(code);
+    http.end();
+    return false;
+  }
+  // Read entire payload first (prevents IncompleteInput)
+  WiFiClient * stream = http.getStreamPtr();
+  String payload; payload.reserve(4096);
+  uint32_t start = millis();
+  const uint32_t READ_TIMEOUT_MS = 4000;
+  while (http.connected() && (millis()-start) < READ_TIMEOUT_MS) {
+    while (stream->available()) {
+      payload += (char)stream->read();
+    }
+    if (!stream->available()) delay(3);
+  }
+  http.end();
+  if (payload.isEmpty()) {
+    Serial.println("[station] Empty response body");
+    return false;
+  }
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("[station] JSON error: "); Serial.println(err.c_str());
+    return false;
+  }
+  return true;
 }
 
-bool getNextTrainForGivenDirection(JsonArrayConst trains, const String& targetStation,
-                                   const String& direction, String& destOut, int& dueOut) {
-  for (JsonObjectConst t : trains) {
-    const char* dest = t["destination"] | "";
-    const char* dir  = t["direction"]   | "";
-    if (!dest || !dir) continue;
-    if (String(dest) == targetStation) continue;
-    if (String(dir) == direction) {
-      int dueIn = atoi((t["dueIn"] | "0"));
-      int late  = atoi((t["late"]  | "0"));
-      destOut = String(dest);
-      dueOut  = dueIn + late;
-      return true;
+// Fetch station list (returns true on success). Tries POST then falls back to GET.
+bool fetchStationList() {
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  const char* url = "https://api.irishtnt.com/stations/";
+  if (!http.begin(client, url)) {
+    Serial.println("[stations] http.begin failed");
+    return false;
+  }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Accept-Encoding", "identity");
+  int code = http.POST((uint8_t*)nullptr, 0);
+  if (code != 200) {
+    Serial.print("[stations] POST status: "); Serial.println(code);
+    http.end();
+    return false;
+  }
+  int contentLen = http.getSize(); // may be -1 (chunked)
+  Serial.print("[stations] HTTP 200 (POST), Content-Length: "); Serial.println(contentLen);
+  WiFiClient * stream = http.getStreamPtr();
+  String payload; payload.reserve(contentLen > 0 && contentLen < 70000 ? contentLen : 30000);
+  uint32_t start = millis();
+  const uint32_t READ_TIMEOUT_MS = 6000;
+  // Read until length reached OR connection closes OR timeout
+  while (http.connected() && (millis()-start) < READ_TIMEOUT_MS) {
+    while (stream->available()) {
+      payload += (char)stream->read();
+    }
+    if (contentLen > 0 && (int)payload.length() >= contentLen) break;
+    if (!stream->available()) delay(4);
+  }
+  http.end();
+  Serial.print("[stations] Bytes received: "); Serial.println(payload.length());
+  if (payload.length() == 0) {
+    Serial.println("[stations] Empty response body");
+    return false;
+  }
+  if (contentLen > 0 && (int)payload.length() != contentLen) {
+    Serial.println("[stations] Warning: received length mismatch (possible truncation)");
+  }
+  // Determine structure: array root or object with "stations" array
+  bool rootIsArray = payload.startsWith("[");
+  bool rootIsObject = !rootIsArray && payload.startsWith("{");
+  DynamicJsonDocument doc((payload.length() + 2048) > 65536 ? 65536 : (payload.length() + 2048));
+  DeserializationError err = deserializeJson(doc, payload);
+  JsonArray arr; // will point to stations
+  if (!err) {
+    if (rootIsArray && doc.is<JsonArray>()) {
+      arr = doc.as<JsonArray>();
+    } else if (rootIsObject && doc.is<JsonObject>() && doc["stations"].is<JsonArray>()) {
+      arr = doc["stations"].as<JsonArray>();
+    } else {
+      Serial.println("[stations] JSON root shape unexpected");
+    }
+  } else {
+    Serial.print("[stations] JSON parse error: "); Serial.println(err.c_str());
+  }
+  stationNames.clear();
+  if (!arr.isNull()) {
+    for (JsonObject st : arr) {
+      const char* name = st["name"];
+      if (name && *name) stationNames.push_back(String(name));
     }
   }
-  return false;
+  if (stationNames.empty()) {
+    // Fallback manual extraction of "name" tokens
+    const char * key = "\"name\""; size_t klen = 6; int idx = 0; int safety = 0;
+    while ((idx = payload.indexOf(key, idx)) != -1 && safety < 3000) {
+      safety++;
+      int colon = payload.indexOf(':', idx + klen); if (colon == -1) break;
+      int firstQuote = payload.indexOf('"', colon+1); if (firstQuote == -1) break;
+      int secondQuote = firstQuote+1;
+      while (secondQuote < (int)payload.length()) {
+        if (payload.charAt(secondQuote) == '"' && payload.charAt(secondQuote-1) != '\\') break;
+        secondQuote++;
+      }
+      if (secondQuote >= (int)payload.length()) break;
+      String name = payload.substring(firstQuote+1, secondQuote);
+      if (name.length()>0) stationNames.push_back(name);
+      idx = secondQuote+1;
+    }
+    Serial.print("[stations] Fallback names extracted: "); Serial.println(stationNames.size());
+  }
+  if (stationNames.empty()) {
+    Serial.println("[stations] No station names found");
+    int tailStart = payload.length() > 140 ? payload.length()-140 : 0;
+    Serial.println(payload.substring(0,120));
+    Serial.println("...tail...");
+    Serial.println(payload.substring(tailStart));
+    return false;
+  }
+  Serial.print("[stations] Loaded stations: "); Serial.println(stationNames.size());
+  return true;
 }
 
+// Normalize direction
+String normalizeDirection(const String& dir) {
+  if (dir.startsWith("To ")) return dir.substring(3);
+  return dir;
+}
+
+// update lines
 void updateLinesFromJson(const JsonDocument& doc) {
   String newL1 = "", newL2 = "";
-
   JsonObjectConst station = doc["station"].as<JsonObjectConst>();
   JsonArrayConst trains   = station["trains"].as<JsonArrayConst>();
-
   if (station.isNull() || trains.isNull() || trains.size()==0) {
     newL1 = "No trains";
   } else {
-    std::vector<String> directions;
-    getStationDirections(trains, TARGET_STATION, directions);
-
+    std::vector<String> seenDirs;
     int shown = 0;
-    for (auto& dir : directions) {
-      String dest; int due = 0;
-      if (getNextTrainForGivenDirection(trains, TARGET_STATION, dir, dest, due)) {
-        String line = dest + ":  " + String(due) + " min";
-        if (shown == 0) newL1 = line;
-        else if (shown == 1) newL2 = line;
-        if (++shown == 2) break;
-      }
+    for (JsonObjectConst t : trains) {
+      const char* dest = t["destination"] | "";
+      const char* dir  = t["direction"]   | "";
+      if (!dest || !dir) continue;
+      if (String(dest) == TARGET_STATION) continue; // skip inbound
+      String normDir = normalizeDirection(String(dir));
+      bool already=false;
+      for (auto& d : seenDirs) if (d == normDir) { already=true; break; }
+      if (already) continue;
+      int dueIn = atoi((t["dueIn"] | "0"));
+      int late  = atoi((t["late"]  | "0"));
+      int due   = dueIn + late; if (due<0) due=0;
+      String line = String(dest) + ":  " + String(due) + " min";
+      if (shown==0) newL1=line; else if (shown==1) newL2=line;
+      seenDirs.push_back(normDir);
+      if (++shown==2) break;
     }
-    if (shown == 0) newL1 = "No services";
+    if (shown==0) newL1="No services";
   }
-
-  bool changed = false;
-  if (newL1 != line1) { line1 = newL1; measureTextWidth(line1, line1W); changed = true; }
-  if (newL2 != line2) { line2 = newL2; measureTextWidth(line2, line2W); changed = true; }
-
-  if (changed) scrollX = SCREEN_W;
+  bool changed=false;
+  if (newL1!=line1){line1=newL1;measureTextWidth(line1,line1W);changed=true;}
+  if (newL2!=line2){line2=newL2;measureTextWidth(line2,line2W);changed=true;}
+  if (changed) scrollX=SCREEN_W;
 }
 
-// ---------- SETUP & LOOP ----------
+// build HTML page
+String buildPage() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Station</title></head><body>";
+  html += "<h2>Select Station</h2><form action='/set'>";
+  html += "<select name='station'>";
+  for (auto& n : stationNames) {
+    html += "<option value='" + n + "'";
+    if (n == TARGET_STATION) html += " selected";
+    html += ">" + n + "</option>";
+  }
+  html += "</select><input type='submit' value='Go'></form>";
+  html += "<p>Current: " + TARGET_STATION + "</p>";
+  html += "</body></html>";
+  return html;
+}
+
+// ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
-
   setCustomPins();
   display = new MatrixPanel_I2S_DMA(mxconfig);
   display->begin();
   display->setBrightness8(80);
   COLOR_ORANGE = display->color565(255, 140, 0);
-
-  line1 = "Matrix OK";
-  line2 = "WiFi...";
-  measureTextWidth(line1, line1W);
-  measureTextWidth(line2, line2W);
-  scrollX = SCREEN_W;
-  drawFrame();
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
-
-  if (WiFi.status() != WL_CONNECTED) { line1 = "WiFi FAIL"; line2 = ""; }
-  else { line1 = "WiFi OK"; line2 = WiFi.localIP().toString(); }
-  measureTextWidth(line1, line1W);
-  measureTextWidth(line2, line2W);
-  scrollX = SCREEN_W;
-  drawFrame();
-
-  // Start web server
-  server.on("/", handleRoot);
-  server.on("/set", HTTP_POST, handleSet);
-  server.begin();
-  Serial.println("Web server started");
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Open http://");
-    Serial.print(WiFi.localIP());
-    Serial.println("/ in your browser");
+  line1="Matrix OK"; line2="WiFi..."; measureTextWidth(line1,line1W);measureTextWidth(line2,line2W);scrollX=SCREEN_W;drawFrame();
+  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_PASS);
+  uint32_t t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000) delay(200);
+  if(WiFi.status()!=WL_CONNECTED){line1="WiFi FAIL";line2="";} else {line1="WiFi OK";line2=WiFi.localIP().toString();}
+  measureTextWidth(line1,line1W);measureTextWidth(line2,line2W);scrollX=SCREEN_W;drawFrame();
+  if(WiFi.status()==WL_CONNECTED) {
+    if(!fetchStationList()) {
+      // Add placeholder so dropdown renders something
+      if (stationNames.empty()) stationNames.push_back("(no stations)");
+    }
   }
 
-  lastFetch = 0;
-  lastScroll = millis();
+  // Web server handlers
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
+    req->send(200,"text/html",buildPage());
+  });
+  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *req){
+    if(req->hasParam("station")){
+      TARGET_STATION=req->getParam("station")->value();
+      scrollX=SCREEN_W; // reset scroll
+    }
+    req->redirect("/");
+  });
+  // Manual refresh endpoint in case list failed at boot
+  server.on("/refresh", HTTP_GET, [](AsyncWebServerRequest *req){
+    bool ok = fetchStationList();
+    String msg = ok ? "Refreshed OK" : "Refresh FAILED";
+    req->send(200, "text/plain", msg);
+  });
+  server.begin();
+  lastFetch=0; lastScroll=millis();
 }
 
+// ---------- LOOP ----------
 void loop() {
-  server.handleClient();   // serve web requests
-
-  unsigned long now = millis();
-
-  if (now - lastFetch >= REFRESH_MS && WiFi.status() == WL_CONNECTED) {
-    DynamicJsonDocument doc(16384);
-    String stationPath = urlEncodeSpacesLower(TARGET_STATION);
-    if (fetchStationJson(stationPath, doc)) {
-      updateLinesFromJson(doc);
-    } else {
-      line1 = "API ERR"; line2 = "";
-      measureTextWidth(line1, line1W);
-      measureTextWidth(line2, line2W);
-      scrollX = SCREEN_W;
+  unsigned long now=millis();
+  if(now-lastFetch>=REFRESH_MS && WiFi.status()==WL_CONNECTED){
+    if(TARGET_STATION.length()>0 && TARGET_STATION != "(no stations)") {
+      DynamicJsonDocument doc(20000);
+      String stationPath=urlEncodeSpacesLower(TARGET_STATION);
+      if(fetchStationJson(stationPath,doc)){updateLinesFromJson(doc);} else {
+        line1="API ERR"; line2=""; measureTextWidth(line1,line1W); measureTextWidth(line2,line2W); scrollX=SCREEN_W;
+      }
     }
-    lastFetch = now;
+    lastFetch=now;
   }
-
   tickScroll();
   drawFrame();
   delay(10);
