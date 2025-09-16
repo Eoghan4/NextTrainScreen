@@ -2,9 +2,10 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <ESPAsyncWebServer.h>           // Async web server
+#include <ESPAsyncWebServer.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <vector>
+#include <algorithm>
 
 // ---------- USER CONFIG ----------
 const char* WIFI_SSID = "SSID";
@@ -239,28 +240,39 @@ void updateLinesFromJson(const JsonDocument& doc) {
   if (station.isNull() || trains.isNull() || trains.size()==0) {
     newL1 = "No trains";
   } else {
-    std::vector<String> seenDirs;
-    int shown = 0;
+    struct TrainPick { String dir; String dest; int due; };
+    std::vector<TrainPick> picks; // one per direction (earliest)
     for (JsonObjectConst t : trains) {
-      const char* dest = t["destination"] | "";
-      const char* dir  = t["direction"]   | "";
-      if (!dest || !dir) continue;
-      if (String(dest) == TARGET_STATION) continue; // skip inbound
-      String normDir = normalizeDirection(String(dir));
-      bool already=false;
-      for (auto& d : seenDirs) if (d == normDir) { already=true; break; }
-      if (already) continue;
+      const char* destC = t["destination"] | "";
+      const char* dirC  = t["direction"]   | "";
+      if (!destC || !dirC) continue;
+      if (String(destC) == TARGET_STATION) continue; // skip trains terminating here
+      String normDir = normalizeDirection(String(dirC));
       int dueIn = atoi((t["dueIn"] | "0"));
       int late  = atoi((t["late"]  | "0"));
-      int due   = dueIn + late; if (due<0) due=0;
-      String line = String(dest) + ":  " + String(due) + " min";
-      if (shown==0) newL1=line; else if (shown==1) newL2=line;
-      seenDirs.push_back(normDir);
-      if (++shown==2) break;
+      int due   = dueIn + late; if (due < 0) due = 0;
+      // Find existing direction
+      bool found=false;
+      for (auto &pk : picks) {
+        if (pk.dir == normDir) {
+          if (due < pk.due) { // earlier train for this direction
+            pk.due = due; pk.dest = String(destC);
+          }
+          found=true; break;
+        }
+      }
+      if (!found) {
+        picks.push_back({normDir, String(destC), due});
+      }
     }
-    if (shown==0) newL1="No services";
+    if (picks.empty()) {
+      newL1 = "No services";
+    } else {
+      std::sort(picks.begin(), picks.end(), [](const TrainPick& a, const TrainPick& b){return a.due < b.due;});
+      newL1 = picks[0].dest + ":  " + String(picks[0].due) + " min";
+      if (picks.size() > 1) newL2 = picks[1].dest + ":  " + String(picks[1].due) + " min";
+    }
   }
-  // Instead of applying directly (may be called from fetch task) store pending
   pendingLine1 = newL1;
   pendingLine2 = newL2;
   newLinesReady = true;
